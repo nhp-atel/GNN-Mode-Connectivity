@@ -1,0 +1,1 @@
+train.py --dir=./curve_gnn --dataset=MUTAG --data_path=./data --model=GAT --curve=Bezier --num_bends=3 --init_start=./endpoint1/checkpoint-100.pt --init_end=./endpoint2/checkpoint-100.pt --fix_start --fix_end --epochs=100 --lr=0.015 --wd=5e-4 --batch_size=32 --num-workers=0
