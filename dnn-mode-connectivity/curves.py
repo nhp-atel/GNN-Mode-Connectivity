@@ -410,6 +410,124 @@ class GATConv(CurveModule):
         return out
 
 
+class GINConv(CurveModule):
+    """
+    Graph Isomorphism Network layer with Bezier curve parameter interpolation.
+
+    Implements GIN message passing where all parameters (MLP weights and epsilon)
+    are interpolated along a Bezier curve in parameter space.
+    """
+
+    def __init__(self, in_channels, out_channels, hidden_channels, fix_points,
+                 eps=0.0, train_eps=True):
+        """
+        Initialize GIN convolution layer with curve parameters.
+
+        Args:
+            in_channels: Input feature dimension
+            out_channels: Output feature dimension
+            hidden_channels: Hidden dimension for 2-layer MLP
+            fix_points: List of bools indicating which bend points are fixed
+            eps: Initial epsilon value for self-connection weighting
+            train_eps: Whether epsilon should be trainable
+        """
+        # Register parameter names: mlp1_weight, mlp1_bias, mlp2_weight, mlp2_bias, eps
+        super(GINConv, self).__init__(fix_points, ('mlp1_weight', 'mlp1_bias',
+                                                     'mlp2_weight', 'mlp2_bias', 'eps'))
+
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.hidden_channels = hidden_channels
+        self.initial_eps = eps
+        self.train_eps = train_eps
+
+        # Register MLP parameters for each bend
+        for i, fixed in enumerate(self.fix_points):
+            # First MLP layer: in_channels -> hidden_channels
+            self.register_parameter(
+                'mlp1_weight_%d' % i,
+                Parameter(torch.Tensor(hidden_channels, in_channels), requires_grad=not fixed)
+            )
+            self.register_parameter(
+                'mlp1_bias_%d' % i,
+                Parameter(torch.Tensor(hidden_channels), requires_grad=not fixed)
+            )
+
+            # Second MLP layer: hidden_channels -> out_channels
+            self.register_parameter(
+                'mlp2_weight_%d' % i,
+                Parameter(torch.Tensor(out_channels, hidden_channels), requires_grad=not fixed)
+            )
+            self.register_parameter(
+                'mlp2_bias_%d' % i,
+                Parameter(torch.Tensor(out_channels), requires_grad=not fixed)
+            )
+
+            # Epsilon parameter for self-connection weighting
+            self.register_parameter(
+                'eps_%d' % i,
+                Parameter(torch.Tensor([eps]), requires_grad=(train_eps and not fixed))
+            )
+
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        """Initialize parameters using Glorot/Xavier initialization"""
+        for i in range(self.num_bends):
+            # Initialize MLP layer 1
+            torch.nn.init.xavier_uniform_(getattr(self, 'mlp1_weight_%d' % i))
+            torch.nn.init.zeros_(getattr(self, 'mlp1_bias_%d' % i))
+
+            # Initialize MLP layer 2
+            torch.nn.init.xavier_uniform_(getattr(self, 'mlp2_weight_%d' % i))
+            torch.nn.init.zeros_(getattr(self, 'mlp2_bias_%d' % i))
+
+            # Initialize epsilon
+            eps_param = getattr(self, 'eps_%d' % i)
+            torch.nn.init.constant_(eps_param, self.initial_eps)
+
+    def forward(self, x, edge_index, coeffs_t):
+        """
+        Forward pass with parameter interpolation.
+
+        Implements GIN update: h = MLP((1 + eps) * h + sum_{j in N(i)} h_j)
+
+        Args:
+            x: Node features [num_nodes, in_channels]
+            edge_index: Edge connectivity [2, num_edges]
+            coeffs_t: Bezier coefficients at curve point t
+
+        Returns:
+            Node features [num_nodes, out_channels]
+        """
+        # Interpolate all parameters at curve point t
+        mlp1_weight_t, mlp1_bias_t, mlp2_weight_t, mlp2_bias_t, eps_t = \
+            self.compute_weights_t(coeffs_t)
+
+        # Message passing: sum aggregation
+        row, col = edge_index[0], edge_index[1]  # row: target, col: source
+
+        # Aggregate neighbor features using sum
+        # For each target node, sum all source node features
+        agg = torch.zeros_like(x)
+        for i in range(x.size(0)):
+            # Find all edges pointing to node i
+            mask = row == i
+            if mask.any():
+                # Sum source node features
+                agg[i] = x[col[mask]].sum(dim=0)
+
+        # GIN update: (1 + eps) * x + aggregation
+        out = (1 + eps_t) * x + agg
+
+        # Apply 2-layer MLP
+        out = F.linear(out, mlp1_weight_t, mlp1_bias_t)
+        out = F.relu(out)
+        out = F.linear(out, mlp2_weight_t, mlp2_bias_t)
+
+        return out
+
+
 class CurveNet(Module):
     def __init__(self, num_classes, curve, architecture, num_bends, fix_start=True, fix_end=True,
                  architecture_kwargs={}):
